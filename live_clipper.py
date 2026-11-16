@@ -230,8 +230,10 @@ def _kill_recorders():
 
 
 class LiveSession:
-    def __init__(self, url, save_dir, chunk_minutes, start_at=None, language=None, job_options=None):
+    def __init__(self, url, save_dir, chunk_minutes, start_at=None, language=None, job_options=None,
+                 delete_recordings=True):
         self.id = uuid.uuid4().hex[:12]
+        self.delete_recordings = bool(delete_recordings)
         self.job_options = clean_job_options(job_options)
         self.url = url
         self.chunk_seconds = chunk_minutes * 60
@@ -284,6 +286,7 @@ class LiveSession:
             "id": self.id, "url": self.url, "title": self.title, "state": self.state,
             "error": self.error, "dir": self.dir, "chunkMinutes": self.chunk_seconds / 60,
             "startAt": self.start_at, "language": self.language or "auto",
+            "deleteRecordings": self.delete_recordings,
             "startedAt": self.started_at, "recordedSeconds": self.recorded_seconds(),
             "chunkCounts": counts,
             "chunks": [{**{k: c.get(k) for k in ("index", "status", "duration", "jobId",
@@ -316,6 +319,7 @@ class LiveSession:
         s.id = data["id"]
         s.dir = data["dir"]
         s.job_options = clean_job_options(data.get("jobOptions"))
+        s.delete_recordings = data.get("deleteRecordings") is not False
         s.title = data.get("title")
         s.started_at = float(data.get("startedAt") or time.time())
         s.chunks = [c for c in data.get("chunks") or [] if isinstance(c, dict)]
@@ -542,8 +546,9 @@ class LiveSession:
         chunk["status"] = "clipping"
         self.note(f"part {chunk['index']} clipping (job {body['job_id'][:8]})")
 
-    @staticmethod
-    def _drop(*paths):
+    def _drop(self, *paths):
+        if not self.delete_recordings:
+            return
         for p in paths:
             try:
                 os.remove(p)
@@ -857,7 +862,8 @@ async def live_start(request: Request):
     await _core()._validate_source_url(url)
     session = LiveSession(url, save_dir, chunk_minutes, start_at,
                           language if language in LANGUAGES else None,
-                          body.get("job_options"))
+                          body.get("job_options"),
+                          delete_recordings=body.get("delete_recordings") is not False)
     try:
         os.makedirs(session.chunk_dir, exist_ok=True)
         os.makedirs(session.state_dir, exist_ok=True)

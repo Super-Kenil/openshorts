@@ -88,7 +88,7 @@ export default function LiveSessionPanel({ session: s, busy, onAct }) {
               {!active
                 ? 'no recordings left on disk'
                 : chunks.length
-                  ? `clipped recordings are deleted · the next one appears within ${s.chunkMinutes} minutes`
+                  ? `${s.deleteRecordings === false ? 'clipped recordings are kept' : 'clipped recordings are deleted'} · the next one appears within ${s.chunkMinutes} minutes`
                   : `the first recording appears here after ${s.chunkMinutes} minutes`}
             </p>
           </div>

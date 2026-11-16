@@ -1181,6 +1181,7 @@ function App() {
             url: data.payload,
             save_dir: data.saveDir,
             chunk_minutes: data.chunkMinutes,
+            delete_recordings: data.deleteRecordings !== false,
             start_at: data.startAt,
             language: data.language,
             job_options: Object.fromEntries(Object.entries({

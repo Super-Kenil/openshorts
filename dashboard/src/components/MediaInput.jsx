@@ -85,6 +85,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [startTime, setStartTime] = useState('');
     const [startNow, setStartNow] = useState(true);
     const [chunkMinutes, setChunkMinutes] = useState(20);
+    const [deleteRecordings, setDeleteRecordings] = useState(() => {
+        try { return localStorage.getItem('live_delete_recordings') !== '0'; } catch { return true; }
+    });
     const isLive = mode === 'url' && live.live && live.url === url.trim();
     const startMs = startNow ? null : liveStartEpoch(startTime);
 
@@ -174,13 +177,17 @@ export default function MediaInput({ onProcess, isProcessing }) {
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
             localStorage.setItem('os_language', language);
-            if (isLive) localStorage.setItem('live_save_dir', saveDir.trim());
+            if (isLive) {
+                localStorage.setItem('live_save_dir', saveDir.trim());
+                localStorage.setItem('live_delete_recordings', deleteRecordings ? '1' : '0');
+            }
         } catch { /* ignore */ }
         if (isLive) {
             if (!saveDir.trim()) return;
             onProcess({
                 type: 'live', payload: url.trim(), acknowledged: true, language,
                 saveDir: saveDir.trim(), chunkMinutes: Number(chunkMinutes) || 20,
+                deleteRecordings,
                 startAt: startMs ? startMs / 1000 : null,
                 ...advanced,
             });
@@ -323,6 +330,20 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                             onChange={(e) => setChunkMinutes(e.target.value)} />
                                     </div>
                                 </div>
+                                <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
+                                    <input
+                                        type="checkbox"
+                                        checked={deleteRecordings}
+                                        onChange={(e) => setDeleteRecordings(e.target.checked)}
+                                        className="w-4 h-4 accent-[var(--color-accent)] cursor-pointer"
+                                    />
+                                    delete each recording after it is clipped
+                                </label>
+                                <p className="text-[11px] text-muted -mt-2">
+                                    {deleteRecordings
+                                        ? 'saves disk space: only the clips are kept'
+                                        : 'recordings stay in the chunks folder next to the clips'}
+                                </p>
                             </div>
                         )}
                     </div>
