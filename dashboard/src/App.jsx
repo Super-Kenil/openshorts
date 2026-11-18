@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, Radio } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
@@ -26,6 +26,7 @@ import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
 import AutopilotTab from './components/AutopilotTab';
+import LiveRecorderTab from './components/LiveRecorderTab';
 import LiveSessionPanel from './components/LiveSessionPanel';
 import { LIVE_ACTIVE_STATES } from './lib/live';
 import TextWatermarkCard from './components/TextWatermarkCard';
@@ -1182,6 +1183,10 @@ function App() {
             save_dir: data.saveDir,
             chunk_minutes: data.chunkMinutes,
             delete_recordings: data.deleteRecordings !== false,
+            chat_spikes: !!data.chatSpikes,
+            chat_lead_seconds: data.chatLead,
+            chat_sensitivity: data.chatSensitivity,
+            caption_style: data.captionStyle || undefined,
             start_at: data.startAt,
             language: data.language,
             job_options: Object.fromEntries(Object.entries({
@@ -1237,6 +1242,10 @@ function App() {
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
         language: data.language && data.language !== 'auto' ? data.language : null,
+        caption_style: data.captionStyle ? JSON.stringify(data.captionStyle) : null,
+        chat_spikes: data.chatSpikes ? '1' : null,
+        chat_lead_seconds: data.chatSpikes ? data.chatLead : null,
+        chat_sensitivity: data.chatSpikes ? data.chatSensitivity : null,
         // Set when the user took the quota wall's "clip the first N minutes"
         // offer: the server reserves N minutes and cuts the source to them.
         max_minutes: data.maxMinutes || null,
@@ -1390,7 +1399,7 @@ function App() {
     try { if (localStorage.getItem(SESSION_KEY)) return; } catch { /* ignore */ }
     apiJson('/api/live')
       .then((data) => {
-        const s = (data.sessions || []).find((x) => LIVE_ACTIVE_STATES.includes(x.state));
+        const s = (data.sessions || []).find((x) => LIVE_ACTIVE_STATES.includes(x.state) && !x.recordOnly);
         if (!s) return;
         setLiveSession(s);
         setStatus((st) => (st === 'idle' ? 'processing' : st));
@@ -1421,7 +1430,7 @@ function App() {
     let stopped = false;
     const load = () => apiJson('/api/live')
       .then((data) => {
-        if (!stopped) setBackgroundLive((data.sessions || []).filter((x) => LIVE_ACTIVE_STATES.includes(x.state)));
+        if (!stopped) setBackgroundLive((data.sessions || []).filter((x) => LIVE_ACTIVE_STATES.includes(x.state) && !x.recordOnly));
       })
       .catch(() => {});
     load();
@@ -1472,6 +1481,7 @@ function App() {
     { id: 'ai-agent', ord: '04', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
+    ...(!billingEnabled ? [{ id: 'live-recorder', ord: '07', icon: Radio, label: 'Live Recorder', short: 'record' }] : []),
     ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
     { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
   ];
@@ -2233,6 +2243,14 @@ function App() {
                     <button onClick={() => setShowLogin(true)} className="btn-primary">sign in</button>
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'live-recorder' && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <div className="max-w-3xl mx-auto p-4 sm:p-6 md:p-8">
+                <LiveRecorderTab />
               </div>
             </div>
           )}

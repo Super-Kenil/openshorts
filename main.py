@@ -32,6 +32,7 @@ import layout_picker
 import llm_backend
 import yt_account
 import twitch_signals
+import chat_spikes
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target,
@@ -1329,7 +1330,8 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
         return None  # silent video: nothing to caption
     try:
         import subtitles as _subs
-        style = _subs.AUTO_CAPTION_STYLE
+        import caption_style as _cstyle
+        style = _cstyle.job_style()
         output_dir = os.path.dirname(clip_path)
         stem = os.path.basename(clip_path)
         generation_id = int(time.time())
@@ -1364,13 +1366,7 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
             split_ranges = _layouts.split_ranges(_layouts.read(clip_path))
         if not _subs.generate_ass(
                 transcript, clip_start, clip_end, ass_path,
-                split_ranges=split_ranges,
-                max_chars=style["max_chars"], max_duration=style["max_duration"],
-                alignment=style["alignment"], fontsize=style["font_size"],
-                font_name=style["font_name"], font_color=style["font_color"],
-                border_color=style["border_color"], border_width=style["border_width"],
-                highlight_color=style["highlight_color"], effect=style["effect"],
-                base_opacity=style["base_opacity"], uppercase=style["uppercase"]):
+                split_ranges=split_ranges, **_cstyle.ass_options(style)):
             print("   ℹ️ No words in range — clip ships without captions.")
             return None
 
@@ -2093,7 +2089,7 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
-def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
+def get_viral_clips(transcript_result, video_duration, viewer_clips=None, chat_windows=None):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
@@ -2129,6 +2125,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             words.append({'w': word['word'], 's': word['start'], 'e': word['end']})
 
     try:
+        if chat_windows:
+            return _chat_pick(client, model_name, language, video_duration, chat_windows, words)
         # Scoring windows must be able to CONTAIN a max-length clip (the detail
         # prompt keeps clips inside their candidate window), so scale them with
         # the requested band — a user asking for 60-90s clips on the default
@@ -2284,6 +2282,64 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
     except Exception as e:
         print(f"❌ Gemini Error: {e}")
         return None
+
+
+def _chat_pick(client, model_name, language, video_duration, chat_windows, words):
+    min_secs, max_secs = clip_duration_bounds()
+    cands, spans = [], {}
+    for i, cw in enumerate(chat_windows, 1):
+        s0 = max(0.0, float(cw["start"]))
+        e0 = min(float(video_duration), float(cw["end"]))
+        if e0 - s0 < 2.0:
+            continue
+        text = " ".join(w["w"].strip() for w in words if w["e"] > s0 and w["s"] < e0).strip()
+        wid = f"chat_{i:02d}"
+        cands.append({"id": wid, "start": round(s0, 3), "end": round(e0, 3),
+                      "text": text or "(no speech in this stretch)",
+                      "viewers_clipped": 1, "viewer_clip_views": int(cw.get("count", 0)),
+                      "viewer_moments": [[round(cw["onset"], 3), round(cw["peak"] + 10.0, 3)]]})
+        spans[wid] = (s0, e0)
+    if not cands:
+        return None
+    print(f"   💬 {len(cands)} chat burst(s) set the clip windows.")
+    costs = []
+
+    def _build(ws):
+        return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
+            video_duration=video_duration, language=language,
+            min_clips=len(ws), max_clips=len(ws), min_secs=min_secs, max_secs=max_secs,
+            windows_json=json.dumps(ws, ensure_ascii=False))
+    proposed = _run_stage_split(client, model_name, cands, _build,
+                                gemini_worker.DetailResponse, "shorts", costs, "detail") or []
+    by_window = {}
+    for s in proposed:
+        by_window.setdefault(str(s.get("source_window_id") or ""), s)
+    shorts = []
+    for c in cands:
+        s = dict(by_window.get(c["id"]) or {
+            "predicted_score": 70, "source_window_id": c["id"],
+            "video_title_for_youtube_short": "Chat went wild",
+            "viral_hook_text": "Chat saw it first",
+            "video_description_for_tiktok": "Chat exploded right here.",
+            "video_description_for_instagram": "Chat exploded right here.", "why": ""})
+        s0, e0 = spans[c["id"]]
+        e0 = min(e0, s0 + max_secs)
+        s["start"], s["end"] = s0, e0
+        s["why"] = (s.get("why") or "") or "Chat message rate jumped here."
+        s["chat_burst"] = {"onset": c["viewer_moments"][0][0], "messages": c["viewer_clip_views"]}
+        s["proposed"] = [s0, e0]
+        ns, ne = snap_clip_to_words(s0, e0, words, video_duration,
+                                    min_duration=min(min_secs, e0 - s0), max_duration=max_secs)
+        s["start"], s["end"] = ns, ne
+        shorts.append(s)
+    result = {"shorts": shorts}
+    if costs:
+        result["cost_analysis"] = {
+            "input_tokens": sum(c.get("input_tokens", 0) for c in costs),
+            "output_tokens": sum(c.get("output_tokens", 0) for c in costs),
+            "total_cost": sum(c.get("total_cost", 0) for c in costs),
+            "model": model_name}
+    return result
 
 
 # --- Speech too sparse to clip by transcript -------------------------------
@@ -2601,6 +2657,9 @@ if __name__ == '__main__':
                         help="Fetch the source (download, cut to the paid minutes), print "
                              "SOURCE_READY <path> and exit: a remote worker renders it.")
 
+    parser.add_argument('--chat-windows', type=str,
+                        help="JSON file of clip windows found from chat bursts (chat_spikes); "
+                             "they replace the model's moment picking.")
     parser.add_argument('--language', type=str, choices=["en", "hi"],
                         help="Spoken language of the source; picks the Whisper language and model.")
 
@@ -2678,6 +2737,23 @@ if __name__ == '__main__':
     if args.url and not args.skip_analysis and not args.prepare_only:
         viewer_clips = twitch_signals.viewer_clips_for_job(args.url, 0)
 
+    chat_windows = []
+    if args.chat_windows:
+        chat_windows = chat_spikes.load_windows(args.chat_windows)
+    elif (args.url and not args.skip_analysis and not args.prepare_only
+          and os.environ.get("CHAT_SPIKES", "").strip() == "1"):
+        _lo, _hi = clip_duration_bounds()
+        chat_windows = chat_spikes.vod_windows(args.url, 0, min_len=_lo, max_len=_hi)
+        try:
+            _off = float(os.environ.get("SOURCE_START_SECONDS") or 0)
+        except ValueError:
+            _off = 0.0
+        if _off and chat_windows:
+            chat_windows = chat_spikes.clean_windows(
+                [dict(w, start=w["start"] - _off, end=w["end"] - _off) for w in chat_windows])
+    if chat_windows:
+        print(f"💬 Chat bursts found: {len(chat_windows)} moment(s) to clip.")
+
     # 1. Get Input Video
     if args.url:
         # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
@@ -2709,7 +2785,8 @@ if __name__ == '__main__':
                 early["transcript"] = t
                 if audio_duration and not speech_is_sparse(t, audio_duration):
                     early["clips"] = get_viral_clips(t, audio_duration,
-                                                     viewer_clips=viewer_clips)
+                                                     viewer_clips=viewer_clips,
+                                                     chat_windows=chat_windows)
             except Exception as e:
                 print(f"   ℹ️ Early transcription skipped ({type(e).__name__}: {e}).")
                 early["transcript"] = early["clips"] = None
@@ -2899,9 +2976,13 @@ if __name__ == '__main__':
             print("♻️ Using the clips Gemini picked while the video downloaded.")
             clips_data = early_clips
         elif transcript is not None:
-            clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips)
+            clips_data = get_viral_clips(transcript, duration, viewer_clips=viewer_clips,
+                                         chat_windows=chat_windows)
         else:
-            clips_data = get_visual_clips(input_video, duration, viewer_clips=viewer_clips)
+            clips_data = get_visual_clips(
+                input_video, duration, viewer_clips=viewer_clips + [
+                    {"start": w["onset"], "end": w["peak"] + 10.0, "views": int(w["ratio"] * 10)}
+                    for w in chat_windows])
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path

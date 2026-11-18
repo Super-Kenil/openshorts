@@ -4085,6 +4085,10 @@ app.include_router(_free_tools.router)
 
 import live_clipper as _live_clipper
 app.include_router(_live_clipper.router)
+import settings_api as _settings_api
+app.include_router(_settings_api.router)
+import caption_style as _caption_style
+import chat_spikes as _chat_spikes
 
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
 # self-host keeps the permissive wildcard it has always used.
@@ -5501,6 +5505,11 @@ async def process_endpoint(
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
+    caption_style: Optional[str] = Form(None),
+    chat_spikes: Optional[str] = Form(None),
+    chat_lead_seconds: Optional[str] = Form(None),
+    chat_sensitivity: Optional[str] = Form(None),
+    chat_windows: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -5536,6 +5545,11 @@ async def process_endpoint(
         source_start = body.get("source_start")
         source_end = body.get("source_end")
         language = body.get("language")
+        caption_style = body.get("caption_style")
+        chat_spikes = body.get("chat_spikes")
+        chat_lead_seconds = body.get("chat_lead_seconds")
+        chat_sensitivity = body.get("chat_sensitivity")
+        chat_windows = body.get("chat_windows")
 
     language = str(language or "").strip().lower()
     if language in ("", "auto"):
@@ -5692,6 +5706,26 @@ async def process_endpoint(
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
 
+    if caption_style:
+        try:
+            raw_style = json.loads(caption_style) if isinstance(caption_style, str) else caption_style
+        except ValueError:
+            raise HTTPException(status_code=400, detail="caption_style must be JSON")
+        if isinstance(raw_style, dict) and raw_style:
+            env["CAPTION_STYLE_JSON"] = json.dumps(_caption_style.resolve(raw_style))
+    else:
+        env.pop("CAPTION_STYLE_JSON", None)
+
+    if str(chat_spikes).lower() in ("1", "true", "yes"):
+        env["CHAT_SPIKES"] = "1"
+        lead = _gen_control(chat_lead_seconds, "chat_lead_seconds", 5, 60)
+        if lead is not None:
+            env["CHAT_SPIKE_LEAD"] = str(lead)
+        ratio = {"low": 3.5, "medium": 2.5, "high": 1.8}.get(str(chat_sensitivity or "medium").lower(), 2.5)
+        env["CHAT_SPIKE_RATIO"] = str(ratio)
+    else:
+        env.pop("CHAT_SPIKES", None)
+
     input_path = None
     if url:
         # Keep the downloaded source inside the job dir: the clip editor's
@@ -5768,6 +5802,17 @@ async def process_endpoint(
         cmd.extend(["--format", output_format])
     if language:
         cmd.extend(["--language", language])
+    if chat_windows:
+        try:
+            raw_windows = json.loads(chat_windows) if isinstance(chat_windows, str) else chat_windows
+        except ValueError:
+            raw_windows = []
+        windows_clean = _chat_spikes.clean_windows(raw_windows)
+        if windows_clean:
+            windows_path = os.path.join(job_output_dir, "chat_windows.json")
+            with open(windows_path, "w", encoding="utf-8") as f:
+                json.dump(windows_clean, f)
+            cmd.extend(["--chat-windows", windows_path])
 
     print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
 

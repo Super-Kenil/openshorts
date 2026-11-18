@@ -129,3 +129,15 @@ def test_restore_keeps_a_paused_session_paused(tmp_path, monkeypatch):
     with open(os.path.join(s.dir, "session.json"), encoding="utf-8") as f:
         r = live_clipper.LiveSession.restore(json.load(f))
     assert r.state == "paused" and r.want_recording is False
+
+
+def test_record_only_session_keeps_parts_in_the_folder_and_never_clips(tmp_path):
+    s = live_clipper.LiveSession("u", str(tmp_path), 20, record_only=True)
+    assert s.chunk_dir == s.dir and s.public()["recordOnly"] is True
+    s._add_chunk(0, os.path.join(s.dir, "part_00000.mp4"), 1200.0, time.time())
+    assert s.chunks[0]["status"] == "saved"
+    assert s.saved()["recordOnly"] is True
+    again = live_clipper.LiveSession.restore(s.saved())
+    assert again.record_only and again.chunk_dir == again.dir
+    normal = live_clipper.LiveSession("u", str(tmp_path), 20)
+    assert normal.chunk_dir.endswith("chunks") and not normal.record_only

@@ -17,3 +17,6 @@ import tempfile  # noqa: E402
 
 os.environ["YT_ACCOUNT_STATE_DIR"] = tempfile.mkdtemp(prefix="yt-account-tests-")
 os.environ.setdefault("YT_ACCOUNT_MIN_INTERVAL", "0")
+
+# SQLite store (db.py): the suite never touches the developer's data/ folder.
+os.environ["OPENSHORTS_DB"] = os.path.join(tempfile.mkdtemp(prefix="openshorts-db-tests-"), "t.db")

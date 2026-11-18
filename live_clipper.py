@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import csv
 import datetime
+import sqlite3
 import json
 import os
 import re
@@ -14,6 +15,11 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
+
+import caption_style
+import chat_spikes
+import clip_selection
+import db
 
 router = APIRouter()
 
@@ -31,6 +37,7 @@ FORMAT = ("bestvideo[height<=1080][protocol^=m3u8]+bestaudio[protocol^=m3u8]/"
 FRAGMENTED = "movflags=+frag_keyframe+empty_moov+default_base_moof"
 ACTIVE = ("scheduled", "waiting", "recording", "paused", "ended")
 LANGUAGES = ("en", "hi")
+SENSITIVITY = {"low": 3.5, "medium": 2.5, "high": 1.8}
 JOB_OPTION_KEYS = ("target_clips", "clip_min_seconds", "clip_max_seconds",
                    "auto_hook", "auto_hook_style", "layouts")
 UPCOMING_HINTS = ("will begin", "begin in", "upcoming", "premiere", "scheduled")
@@ -177,23 +184,27 @@ def _write_json(path, data):
 
 def _read_registry():
     try:
-        with open(REGISTRY, encoding="utf-8") as f:
-            data = json.load(f)
-        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+        reg = db.live_registry()
+        if not reg:
+            with open(REGISTRY, encoding="utf-8") as f:
+                legacy = json.load(f)
+            if isinstance(legacy, dict):
+                for k, v in legacy.items():
+                    db.live_registry_set(str(k), str(v))
+                reg = {str(k): str(v) for k, v in legacy.items()}
+            os.replace(REGISTRY, REGISTRY + ".imported")
+        return reg
+    except (OSError, ValueError, sqlite3.Error):
         return {}
 
 
 def _registry_set(session_id, session_dir):
-    reg = _read_registry()
-    if session_dir:
-        reg[session_id] = session_dir
-    else:
-        reg.pop(session_id, None)
     try:
-        os.makedirs(os.path.dirname(REGISTRY), exist_ok=True)
-        _write_json(REGISTRY, reg)
-    except OSError:
+        if session_dir:
+            db.live_registry_set(session_id, session_dir)
+        else:
+            db.live_registry_remove(session_id)
+    except sqlite3.Error:
         pass
 
 
@@ -231,9 +242,17 @@ def _kill_recorders():
 
 class LiveSession:
     def __init__(self, url, save_dir, chunk_minutes, start_at=None, language=None, job_options=None,
-                 delete_recordings=True):
+                 delete_recordings=True, chat_spikes_on=False, chat_lead=chat_spikes.DEFAULT_LEAD,
+                 chat_sensitivity="medium", style=None, record_only=False):
         self.id = uuid.uuid4().hex[:12]
+        self.record_only = bool(record_only)
         self.delete_recordings = bool(delete_recordings)
+        self.channel = chat_spikes.channel_from_url(url)
+        self.chat_spikes = bool(chat_spikes_on) and self.channel is not None and not self.record_only
+        self.chat_lead = max(5.0, min(60.0, float(chat_lead)))
+        self.chat_sensitivity = chat_sensitivity if chat_sensitivity in SENSITIVITY else "medium"
+        self.caption_style = caption_style.resolve(style) if style else None
+        self.chat = None
         self.job_options = clean_job_options(job_options)
         self.url = url
         self.chunk_seconds = chunk_minutes * 60
@@ -261,7 +280,7 @@ class LiveSession:
 
     @property
     def chunk_dir(self):
-        return os.path.join(self.dir, "chunks")
+        return self.dir if self.record_only else os.path.join(self.dir, "chunks")
 
     @property
     def state_dir(self):
@@ -286,7 +305,11 @@ class LiveSession:
             "id": self.id, "url": self.url, "title": self.title, "state": self.state,
             "error": self.error, "dir": self.dir, "chunkMinutes": self.chunk_seconds / 60,
             "startAt": self.start_at, "language": self.language or "auto",
-            "deleteRecordings": self.delete_recordings,
+            "deleteRecordings": self.delete_recordings, "recordOnly": self.record_only,
+            "chatSpikes": self.chat_spikes, "chatLead": self.chat_lead,
+            "chatSensitivity": self.chat_sensitivity,
+            "chatMessages": self.chat.total if self.chat is not None else 0,
+            "chatLive": bool(self.chat is not None and self.chat.connected),
             "startedAt": self.started_at, "recordedSeconds": self.recorded_seconds(),
             "chunkCounts": counts,
             "chunks": [{**{k: c.get(k) for k in ("index", "status", "duration", "jobId",
@@ -301,6 +324,7 @@ class LiveSession:
         data.update({"chunks": self.chunks, "clips": self.clips, "log": self.log,
                      "run": self.run, "nextIndex": self.next_index,
                      "chunkSeconds": self.chunk_seconds, "jobOptions": self.job_options,
+                     "captionStyle": self.caption_style,
                      "recorderPid": self.recorder.pid if self.recorder is not None else None})
         return data
 
@@ -320,6 +344,11 @@ class LiveSession:
         s.dir = data["dir"]
         s.job_options = clean_job_options(data.get("jobOptions"))
         s.delete_recordings = data.get("deleteRecordings") is not False
+        s.record_only = bool(data.get("recordOnly"))
+        s.chat_spikes = bool(data.get("chatSpikes")) and s.channel is not None
+        s.chat_lead = max(5.0, min(60.0, float(data.get("chatLead") or chat_spikes.DEFAULT_LEAD)))
+        s.chat_sensitivity = data.get("chatSensitivity") if data.get("chatSensitivity") in SENSITIVITY else "medium"
+        s.caption_style = caption_style.resolve(data["captionStyle"]) if data.get("captionStyle") else None
         s.title = data.get("title")
         s.started_at = float(data.get("startedAt") or time.time())
         s.chunks = [c for c in data.get("chunks") or [] if isinstance(c, dict)]
@@ -377,7 +406,7 @@ class LiveSession:
     def _add_chunk(self, index, path, duration, started):
         self.chunks.append({
             "index": index, "file": path, "duration": round(max(0.0, duration), 1),
-            "status": "recorded", "jobId": None, "clips": 0, "error": None,
+            "status": "saved" if self.record_only else "recorded", "jobId": None, "clips": 0, "error": None,
             "recordedAt": datetime.datetime.fromtimestamp(started).isoformat(timespec="seconds"),
         })
         self.chunks.sort(key=lambda c: c["index"])
@@ -524,6 +553,12 @@ class LiveSession:
         payload = {**self.job_options, "upload_id": upload_id, "acknowledged": True}
         if self.language:
             payload["language"] = self.language
+        if self.caption_style:
+            payload["caption_style"] = self.caption_style
+        windows = await asyncio.to_thread(self.chat_windows_for, chunk, duration)
+        if windows:
+            payload["chat_windows"] = windows
+            self.note(f"part {chunk['index']}: {len(windows)} chat burst(s) set the clips")
         try:
             transport = httpx.ASGITransport(app=core.app)
             async with httpx.AsyncClient(transport=transport, base_url="http://live-clipper",
@@ -545,6 +580,23 @@ class LiveSession:
             return
         chunk["status"] = "clipping"
         self.note(f"part {chunk['index']} clipping (job {body['job_id'][:8]})")
+
+    def chat_windows_for(self, chunk, duration):
+        if not self.chat_spikes:
+            return []
+        try:
+            begin = datetime.datetime.fromisoformat(chunk["recordedAt"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            return []
+        lo, hi = clip_selection.clip_duration_bounds()
+        try:
+            return chat_spikes.windows_for_range(
+                f"live:{self.id}", int(begin // chat_spikes.BUCKET * chat_spikes.BUCKET),
+                int(begin + duration), duration=duration, ratio=SENSITIVITY[self.chat_sensitivity],
+                lead=self.chat_lead, min_len=lo, max_len=hi)
+        except Exception as e:
+            self.note(f"chat bursts not read: {e}")
+            return []
 
     def _drop(self, *paths):
         if not self.delete_recordings:
@@ -606,7 +658,20 @@ class LiveSession:
         chunk["status"] = "done"
         self.note(f"part {chunk['index']} done: {chunk['clips']} clip(s) saved")
 
+    async def sync_chat(self):
+        want = self.chat_spikes and self.state == "recording"
+        if want and self.chat is None:
+            try:
+                self.chat = chat_spikes.ChatCounter(self.channel, f"live:{self.id}", note=self.note)
+                self.chat.start()
+            except ValueError:
+                self.chat_spikes = False
+        elif not want and self.chat is not None:
+            counter, self.chat = self.chat, None
+            await counter.stop()
+
     async def tick(self):
+        await self.sync_chat()
         if self.state == "scheduled" and time.time() >= (self.start_at or 0):
             self.state = "waiting"
             self.note("start time reached")
@@ -653,6 +718,9 @@ class LiveSession:
                 self.save()
                 await asyncio.sleep(POLL_SECONDS)
         finally:
+            if self.chat is not None:
+                counter, self.chat = self.chat, None
+                await counter.stop()
             if self.recorder is not None:
                 await self.stop_recorder(graceful=False)
             if self.state not in ACTIVE:
@@ -853,8 +921,10 @@ async def live_start(request: Request):
         raise HTTPException(status_code=400, detail="Paste the live stream URL")
     if not save_dir or not os.path.isabs(save_dir):
         raise HTTPException(status_code=400, detail="Choose a save folder (a full path, e.g. D:\\Clips)")
-    if not 5 <= chunk_minutes <= 60:
-        raise HTTPException(status_code=400, detail="chunk_minutes must be between 5 and 60")
+    record_only = body.get("record_only") is True
+    low, high = (1, 720) if record_only else (5, 60)
+    if not low <= chunk_minutes <= high:
+        raise HTTPException(status_code=400, detail=f"chunk_minutes must be between {low} and {high}")
     if language not in LANGUAGES + ("auto",):
         raise HTTPException(status_code=400, detail="language must be en, hi or auto")
     if start_at is not None and start_at > time.time() + MAX_SCHEDULE_DAYS * 86400:
@@ -863,7 +933,12 @@ async def live_start(request: Request):
     session = LiveSession(url, save_dir, chunk_minutes, start_at,
                           language if language in LANGUAGES else None,
                           body.get("job_options"),
-                          delete_recordings=body.get("delete_recordings") is not False)
+                          delete_recordings=body.get("delete_recordings") is not False,
+                          chat_spikes_on=body.get("chat_spikes") is not False,
+                          chat_lead=body.get("chat_lead_seconds") or chat_spikes.DEFAULT_LEAD,
+                          chat_sensitivity=str(body.get("chat_sensitivity") or "medium").lower(),
+                          style=body.get("caption_style") if isinstance(body.get("caption_style"), dict) else None,
+                          record_only=record_only)
     try:
         os.makedirs(session.chunk_dir, exist_ok=True)
         os.makedirs(session.state_dir, exist_ok=True)

@@ -6,6 +6,9 @@ import { apiJson } from '../lib/api';
 import { liveStartEpoch, fmtWhen } from '../lib/live';
 import SourceCost from './SourceCost';
 import FolderBrowser from './FolderBrowser';
+import CaptionStudio from './CaptionStudio';
+import { DEFAULT_CAPTION_STYLE } from '../lib/captionLooks';
+import { useServerSetting } from '../lib/serverSettings';
 
 const SUPPORTED_PLATFORMS = [
     'YouTube', 'Vimeo', 'TikTok', 'X / Twitter', 'Twitch', 'Kick',
@@ -60,34 +63,30 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
     // Auto-hook: burn the AI hook text into every clip. On by default; the
     // choice persists so turning it off sticks across sessions.
-    const [autoHook, setAutoHook] = useState(() => {
-        try { return localStorage.getItem('os_auto_hook') !== '0'; } catch { return true; }
-    });
-    const [autoHookStyle, setAutoHookStyle] = useState(() => {
-        // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
-        try { return localStorage.getItem('os_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
-    });
+    const [autoHook, setAutoHook] = useServerSetting('auto_hook', true,
+        { key: 'os_auto_hook', parse: (v) => v !== '0' });
+    // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
+    const [autoHookStyle, setAutoHookStyle] = useServerSetting('auto_hook_style', 'pill',
+        { key: 'os_auto_hook_style_v2' });
     // Layout: 'auto' lets the AI pick per video (server default); the others
     // force one on so a podcast host who knows what they uploaded doesn't
     // depend on the detector, and 'none' keeps the plain single crop.
-    const [layout, setLayout] = useState(() => {
-        try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
-    });
-    const [language, setLanguage] = useState(() => {
-        try { return localStorage.getItem('os_language') || 'en'; } catch { return 'en'; }
-    });
+    const [layout, setLayout] = useServerSetting('layout', 'auto', { key: 'os_layout' });
+    const [language, setLanguage] = useServerSetting('language', 'en', { key: 'os_language' });
+    const [captionStyle, setCaptionStyle, settingsReady] = useServerSetting('caption_style', DEFAULT_CAPTION_STYLE);
+    const [chatSpikes, setChatSpikes] = useServerSetting('chat_spikes', true);
+    const [chatLead, setChatLead] = useServerSetting('chat_lead_seconds', 25);
+    const [chatSensitivity, setChatSensitivity] = useServerSetting('chat_sensitivity', 'medium');
     const infoRef = useRef(null);
     const [live, setLive] = useState({ checking: false, live: false, url: '' });
-    const [saveDir, setSaveDir] = useState(() => {
-        try { return localStorage.getItem('live_save_dir') || ''; } catch { return ''; }
-    });
+    const [saveDir, setSaveDir] = useServerSetting('live_save_dir', '', { key: 'live_save_dir' });
     const [browsing, setBrowsing] = useState(false);
     const [startTime, setStartTime] = useState('');
     const [startNow, setStartNow] = useState(true);
-    const [chunkMinutes, setChunkMinutes] = useState(20);
-    const [deleteRecordings, setDeleteRecordings] = useState(() => {
-        try { return localStorage.getItem('live_delete_recordings') !== '0'; } catch { return true; }
-    });
+    const [chunkMinutes, setChunkMinutes] = useServerSetting('live_chunk_minutes', 20);
+    const [deleteRecordings, setDeleteRecordings] = useServerSetting('live_delete_recordings', true,
+        { key: 'live_delete_recordings', parse: (v) => v !== '0' });
+    const isTwitch = mode === 'url' && /^https?:\/\/([a-z0-9-]+\.)?twitch\.tv\//i.test(url.trim());
     const isLive = mode === 'url' && live.live && live.url === url.trim();
     const startMs = startNow ? null : liveStartEpoch(startTime);
 
@@ -169,19 +168,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
             autoHookStyle,
             layout,
             language,
+            captionStyle,
+            chatSpikes: isTwitch && chatSpikes,
+            chatLead,
+            chatSensitivity,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
         };
-        try {
-            localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
-            localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
-            localStorage.setItem('os_layout', layout);
-            localStorage.setItem('os_language', language);
-            if (isLive) {
-                localStorage.setItem('live_save_dir', saveDir.trim());
-                localStorage.setItem('live_delete_recordings', deleteRecordings ? '1' : '0');
-            }
-        } catch { /* ignore */ }
         if (isLive) {
             if (!saveDir.trim()) return;
             onProcess({
@@ -399,6 +392,46 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         onRangeChange={setRange}
                     />
                 )}
+
+                {isTwitch && (
+                    <div className="mt-5 rounded-card border border-rule2 p-3 sm:p-4 space-y-3">
+                        <label className="flex items-center gap-2 text-sm text-ink cursor-pointer select-none">
+                            <input
+                                type="checkbox"
+                                checked={chatSpikes}
+                                onChange={(e) => setChatSpikes(e.target.checked)}
+                                className="w-4 h-4 accent-[var(--color-accent)] cursor-pointer"
+                            />
+                            clip where chat bursts
+                        </label>
+                        <p className="text-[11px] leading-relaxed text-muted">
+                            Chat messages are counted every 10 seconds and kept. When chat suddenly talks much
+                            faster than it did a minute before, the clip opens before that moment so it has its setup.
+                            {isLive ? ' Counted live while recording.' : ' For a past broadcast the chat is downloaded locally with TwitchDownloader.'}
+                        </p>
+                        {chatSpikes && (
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <p className="eyebrow mb-1.5">start before burst (s) · {chatLead}</p>
+                                    <input type="range" min="20" max="30" value={chatLead}
+                                        onChange={(e) => setChatLead(Number(e.target.value))}
+                                        className="w-full accent-[var(--color-accent)]" />
+                                </div>
+                                <div>
+                                    <p className="eyebrow mb-1.5">sensitivity</p>
+                                    <select className="input-field text-xs py-1.5" value={chatSensitivity}
+                                        onChange={(e) => setChatSensitivity(e.target.value)}>
+                                        <option value="low">Low: big bursts only</option>
+                                        <option value="medium">Medium</option>
+                                        <option value="high">High: more clips</option>
+                                    </select>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                <CaptionStudio value={captionStyle} onChange={setCaptionStyle} ready={settingsReady} />
 
                 <div className="mt-5">
                     <p className="eyebrow mb-2">Spoken language</p>
